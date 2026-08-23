@@ -18,7 +18,7 @@ permissions:
 jobs:
   dast:
     runs-on: ubuntu-latest
-    timeout-minutes: 12
+    timeout-minutes: 15
 
     steps:
       - name: Verify authorisation confirmation
@@ -43,19 +43,39 @@ jobs:
           go install github.com/projectdiscovery/httpx/cmd/httpx@latest
           go install github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest
           echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
-
-      - name: Update Nuclei templates
-        shell: bash
-        run: |
           "$(go env GOPATH)/bin/nuclei" -update-templates
 
-      - name: Run optional VibeSec DAST
+      - name: Run VibeSec discovery and Nuclei
         shell: bash
         run: |
           python3 scripts/dast/vibesec_dast.py \
             --target "${{ github.event.inputs.target }}" \
             --output dast-results \
-            --time-budget 420
+            --time-budget 240
+
+      - name: Run OWASP ZAP baseline
+        shell: bash
+        continue-on-error: true
+        run: |
+          mkdir -p dast-results/zap-work
+          chmod 777 dast-results/zap-work
+          docker run --rm \
+            -v "$PWD/dast-results/zap-work:/zap/wrk/:rw" \
+            ghcr.io/zaproxy/zaproxy:stable \
+            zap-baseline.py -t "${{ github.event.inputs.target }}" \
+            -J zap.json -w zap.md -r zap.html -m 2 -I || true
+          cp dast-results/zap-work/zap.json dast-results/zap.json 2>/dev/null || true
+          cp dast-results/zap-work/zap.md dast-results/zap.md 2>/dev/null || true
+          cp dast-results/zap-work/zap.html dast-results/zap.html 2>/dev/null || true
+
+      - name: Merge scanner evidence and regenerate reports
+        if: always()
+        shell: bash
+        run: |
+          python3 scripts/dast/vibesec_dast.py \
+            --target "${{ github.event.inputs.target }}" \
+            --output dast-results \
+            --report-only
 
       - name: Publish mobile-friendly summary
         if: always()
