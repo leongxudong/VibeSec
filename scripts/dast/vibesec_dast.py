@@ -1,167 +1,106 @@
 #!/usr/bin/env python3
-
-import argparse
-import html
-import ipaddress
-import json
-import socket
-import subprocess
-import sys
+import argparse, html, ipaddress, json, socket, subprocess, sys
 from pathlib import Path
 from urllib.parse import urlparse
 
 
-def fail(message: str) -> None:
-    print(f"[VibeSec DAST] ERROR: {message}", file=sys.stderr)
-    raise SystemExit(2)
+def fail(msg):
+    print(f"[VibeSec DAST] ERROR: {msg}", file=sys.stderr); raise SystemExit(2)
 
 
-def validate_target(raw_target: str) -> str:
-    parsed = urlparse(raw_target)
-    if parsed.scheme not in {"http", "https"}:
-        fail("Target must use http:// or https://")
-    if not parsed.hostname:
-        fail("Target must include a hostname")
-    if parsed.username or parsed.password:
-        fail("Credentials in target URLs are not permitted")
+def validate_target(raw):
+    p=urlparse(raw)
+    if p.scheme not in {"http","https"} or not p.hostname or p.username or p.password: fail("Target must be an HTTP(S) URL without embedded credentials")
+    try: answers=socket.getaddrinfo(p.hostname.rstrip('.'),p.port or (443 if p.scheme=='https' else 80),type=socket.SOCK_STREAM)
+    except socket.gaierror as e: fail(f"Target hostname could not be resolved: {e}")
+    for value in {x[4][0] for x in answers}:
+        if not ipaddress.ip_address(value).is_global: fail(f"Target resolves to non-public address {value}")
+    return raw
 
-    host = parsed.hostname.rstrip(".")
+
+def run(cmd,path,timeout):
     try:
-        answers = socket.getaddrinfo(host, parsed.port or (443 if parsed.scheme == "https" else 80), type=socket.SOCK_STREAM)
-    except socket.gaierror as exc:
-        fail(f"Target hostname could not be resolved: {exc}")
-
-    resolved = sorted({item[4][0] for item in answers})
-    if not resolved:
-        fail("Target hostname resolved to no addresses")
-
-    for value in resolved:
-        ip = ipaddress.ip_address(value)
-        if not ip.is_global:
-            fail(f"Target resolves to a non-public address ({ip}); VibeSec DAST refuses this target")
-
-    print(f"[VibeSec DAST] Validated target {raw_target} -> {', '.join(resolved)}")
-    return raw_target
-
-
-def run(command: list[str], output_path: Path, timeout: int | None = None) -> int:
-    print("[VibeSec DAST] Running:", " ".join(command))
-    try:
-        with output_path.open("w", encoding="utf-8") as handle:
-            completed = subprocess.run(command, stdout=handle, stderr=subprocess.STDOUT, text=True, check=False, timeout=timeout)
-        return completed.returncode
+        with path.open('w',encoding='utf-8') as h: return subprocess.run(cmd,stdout=h,stderr=subprocess.STDOUT,text=True,check=False,timeout=timeout).returncode
     except subprocess.TimeoutExpired:
-        with output_path.open("a", encoding="utf-8") as handle:
-            handle.write("\n[VibeSec DAST] Scan stopped after reaching the configured time budget.\n")
+        with path.open('a',encoding='utf-8') as h: h.write('\n[VibeSec] time budget reached\n')
         return 124
 
 
-def read_jsonl(path: Path) -> list[dict]:
-    items: list[dict] = []
-    if not path.exists():
-        return items
-    for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
-        line = line.strip()
-        if not line.startswith("{"):
-            continue
+def jsonl(path):
+    out=[]
+    if not path.exists(): return out
+    for line in path.read_text(errors='replace').splitlines():
         try:
-            items.append(json.loads(line))
-        except json.JSONDecodeError:
-            continue
-    return items
+            if line.lstrip().startswith('{'): out.append(json.loads(line))
+        except json.JSONDecodeError: pass
+    return out
 
 
-def normalise_nuclei(item: dict) -> dict:
-    info = item.get("info") or {}
-    classification = info.get("classification") or {}
-    return {
-        "source": "nuclei",
-        "template_id": item.get("template-id"),
-        "name": info.get("name") or item.get("template-id") or "Nuclei finding",
-        "severity": (info.get("severity") or "unknown").lower(),
-        "matched_at": item.get("matched-at") or item.get("host"),
-        "description": info.get("description"),
-        "tags": info.get("tags") or [],
-        "cve_id": classification.get("cve-id"),
-        "cwe_id": classification.get("cwe-id"),
-    }
+def nuclei_findings(path):
+    out=[]
+    for x in jsonl(path):
+        i=x.get('info') or {}; c=i.get('classification') or {}
+        out.append({'engine':'Nuclei','name':i.get('name') or x.get('template-id') or 'Finding','severity':(i.get('severity') or 'unknown').lower(),'url':x.get('matched-at') or x.get('host'),'description':i.get('description'),'cve':c.get('cve-id'),'cwe':c.get('cwe-id')})
+    return out
 
 
-def render_markdown(report: dict) -> str:
-    s = report["summary"]
-    timed_out = report["tool_status"]["nuclei_timed_out"]
-    lines = [
-        "# VibeSec DAST Summary",
-        "",
-        f"**Target:** {report['target']}",
-        f"**Status:** {'PARTIAL — time budget reached' if timed_out else 'Completed'}",
-        "",
-        "## Findings",
-        f"- Critical: {s['critical']}",
-        f"- High: {s['high']}",
-        f"- Medium: {s['medium']}",
-        "",
-    ]
-    findings = report["findings"][:20]
-    if findings:
-        lines.append("## Top findings")
-        for f in findings:
-            lines.append(f"- **{f['severity'].upper()}** — {f['name']} — {f.get('matched_at') or 'target'}")
-    else:
-        lines.append("No medium/high/critical Nuclei findings were recorded in this run.")
-    lines += ["", "> DAST findings are scanner evidence, not proof of exploitability. Validate consequential findings manually."]
-    return "\n".join(lines) + "\n"
+def zap_findings(path):
+    if not path.exists(): return []
+    try: data=json.loads(path.read_text(errors='replace'))
+    except Exception: return []
+    out=[]
+    riskmap={'3':'high','2':'medium','1':'low','0':'info'}
+    for site in data.get('site',[]):
+        for a in site.get('alerts',[]):
+            sev=riskmap.get(str(a.get('riskcode')),str(a.get('riskdesc','unknown')).split()[0].lower())
+            inst=a.get('instances') or [{}]
+            out.append({'engine':'OWASP ZAP','name':a.get('alert') or a.get('name') or 'ZAP finding','severity':sev,'url':inst[0].get('uri') or site.get('@name'),'description':a.get('desc'),'cwe':a.get('cweid')})
+    return out
 
 
-def render_html(report: dict) -> str:
-    s = report["summary"]
-    timed_out = report["tool_status"]["nuclei_timed_out"]
-    cards = "".join(
-        f"<div class='metric'><b>{label}</b><span>{s[key]}</span></div>"
-        for key, label in [("critical", "Critical"), ("high", "High"), ("medium", "Medium")]
-    )
-    finding_html = "".join(
-        "<article><div class='sev {sev}'>{sev}</div><h3>{name}</h3><p>{where}</p><p>{desc}</p></article>".format(
-            sev=html.escape(f["severity"]),
-            name=html.escape(f["name"]),
-            where=html.escape(f.get("matched_at") or ""),
-            desc=html.escape(f.get("description") or "No description supplied by template."),
-        )
-        for f in report["findings"][:30]
-    ) or "<p class='muted'>No medium/high/critical findings were recorded in this run.</p>"
-    status = "Partial — scan time budget reached" if timed_out else "Completed"
-    return f"""<!doctype html><html><head><meta name='viewport' content='width=device-width,initial-scale=1'><meta charset='utf-8'><title>VibeSec DAST Report</title><style>body{{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;margin:0;background:#0b1220;color:#f8fafc}}main{{max-width:760px;margin:auto;padding:24px}}.muted,p{{color:#b8c1d1;line-height:1.55}}.metrics{{display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin:20px 0}}.metric,article{{background:#111b2e;border:1px solid #26344f;border-radius:18px;padding:16px}}.metric b{{display:block;color:#9fb0c9;font-size:.8rem}}.metric span{{font-size:2rem;font-weight:800}}article{{margin:12px 0}}h1{{font-size:2rem;margin-bottom:6px}}h3{{margin:8px 0}}.sev{{display:inline-block;padding:5px 9px;border-radius:999px;background:#26344f;font-size:.75rem;font-weight:800;text-transform:uppercase}}.critical{{background:#7f1d1d}}.high{{background:#9a3412}}.medium{{background:#854d0e}}@media(max-width:520px){{.metrics{{grid-template-columns:1fr}}}}</style></head><body><main><h1>VibeSec DAST</h1><p>{html.escape(report['target'])}</p><p><b>Status:</b> {status}</p><div class='metrics'>{cards}</div><h2>Findings</h2>{finding_html}<p class='muted'>Scanner evidence is not proof of exploitability. Validate consequential findings manually.</p></main></body></html>"""
+def counts(findings):
+    c={k:0 for k in ['critical','high','medium','low','info','unknown']}
+    for f in findings: c[f['severity'] if f['severity'] in c else 'unknown']+=1
+    return c
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(description="VibeSec optional safe DAST verification")
-    parser.add_argument("--target", required=True)
-    parser.add_argument("--output", default="dast-results")
-    parser.add_argument("--time-budget", type=int, default=420)
-    args = parser.parse_args()
-
-    target = validate_target(args.target.strip())
-    output_dir = Path(args.output)
-    output_dir.mkdir(parents=True, exist_ok=True)
-    httpx_raw = output_dir / "httpx.jsonl"
-    nuclei_raw = output_dir / "nuclei.jsonl"
-
-    httpx_rc = run(["httpx", "-u", target, "-json", "-silent", "-status-code", "-title", "-tech-detect", "-server", "-tls-grab", "-follow-redirects", "-timeout", "10"], httpx_raw, timeout=60)
-    nuclei_rc = run(["nuclei", "-u", target, "-jsonl", "-silent", "-severity", "medium,high,critical", "-exclude-tags", "fuzz,dos,bruteforce,headless", "-rate-limit", "20", "-bulk-size", "10", "-timeout", "8", "-retries", "0"], nuclei_raw, timeout=args.time_budget)
-
-    httpx = read_jsonl(httpx_raw)
-    nuclei = [normalise_nuclei(item) for item in read_jsonl(nuclei_raw)]
-    counts = {"critical": 0, "high": 0, "medium": 0, "low": 0, "unknown": 0}
-    for finding in nuclei:
-        severity = finding.get("severity", "unknown")
-        counts[severity if severity in counts else "unknown"] += 1
-
-    report = {"schema_version": "0.3", "mode": "optional-safe-dast", "target": target, "time_budget_seconds": args.time_budget, "tool_status": {"httpx_exit_code": httpx_rc, "nuclei_exit_code": nuclei_rc, "nuclei_timed_out": nuclei_rc == 124}, "summary": counts, "http_observations": httpx, "findings": nuclei}
-    (output_dir / "vibesec-dast-report.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
-    (output_dir / "vibesec-dast-summary.md").write_text(render_markdown(report), encoding="utf-8")
-    (output_dir / "vibesec-dast-report.html").write_text(render_html(report), encoding="utf-8")
-    print(f"[VibeSec DAST] Reports written to {output_dir}")
+def md(report):
+    c=report['summary']; status=report['status']; engines=', '.join(report['engines'])
+    lines=['# VibeSec DAST Summary','',f"**Target:** {report['target']}",f"**Status:** {status}",f"**Engines:** {engines}",'','## Findings',f"- Critical: {c['critical']}",f"- High: {c['high']}",f"- Medium: {c['medium']}",f"- Low / informational: {c['low']+c['info']}",'']
+    important=[f for f in report['findings'] if f['severity'] in {'critical','high','medium'}][:20]
+    if important:
+        lines+=['## Priority findings']+[f"- **{f['severity'].upper()} · {f['engine']}** — {f['name']} — {f.get('url') or 'target'}" for f in important]
+    else: lines+=['No medium/high/critical findings were recorded. This is not proof that the application is vulnerability-free.']
+    lines+=['','> VibeSec correlates automated scanner evidence. Findings require validation; absence of findings is not assurance of security.']
+    return '\n'.join(lines)+'\n'
 
 
-if __name__ == "__main__":
-    main()
+def html_report(r):
+    cards=''.join(f"<div class=m><small>{k.title()}</small><b>{r['summary'][k]}</b></div>" for k in ['critical','high','medium','low'])
+    fs=''.join(f"<article><span>{html.escape(f['severity'].upper())} · {html.escape(f['engine'])}</span><h3>{html.escape(f['name'])}</h3><p>{html.escape(f.get('url') or '')}</p><p>{html.escape((f.get('description') or 'No scanner description.')[:800])}</p></article>" for f in r['findings'][:50]) or '<p>No findings recorded.</p>'
+    return f"""<!doctype html><meta name=viewport content='width=device-width,initial-scale=1'><meta charset=utf-8><title>VibeSec DAST</title><style>body{{font-family:-apple-system,sans-serif;background:#0b1220;color:#f8fafc;margin:0}}main{{max-width:760px;margin:auto;padding:20px}}p{{color:#b8c1d1;line-height:1.5}}.grid{{display:grid;grid-template-columns:repeat(4,1fr);gap:8px}}.m,article{{background:#111b2e;border:1px solid #26344f;border-radius:16px;padding:15px;margin:10px 0}}.m small{{display:block;color:#9fb0c9}}.m b{{font-size:1.8rem}}article span{{font-size:.75rem;font-weight:800;color:#93c5fd}}@media(max-width:520px){{.grid{{grid-template-columns:1fr 1fr}}}}</style><main><h1>VibeSec DAST</h1><p>{html.escape(r['target'])}</p><p><b>Status:</b> {r['status']} · <b>Engines:</b> {html.escape(', '.join(r['engines']))}</p><div class=grid>{cards}</div><h2>Findings</h2>{fs}<p>Automated evidence requires validation. Zero findings is not proof of security.</p></main>"""
+
+
+def build_report(target,out):
+    nf=nuclei_findings(out/'nuclei.jsonl'); zf=zap_findings(out/'zap.json'); findings=nf+zf
+    state={}
+    try: state=json.loads((out/'scan-state.json').read_text())
+    except Exception: pass
+    engines=['httpx','Nuclei']+(['OWASP ZAP'] if (out/'zap.json').exists() else [])
+    partial=state.get('nuclei_exit_code')==124 or not (out/'zap.json').exists()
+    report={'schema_version':'0.4','target':target,'status':'PARTIAL' if partial else 'COMPLETE','engines':engines,'summary':counts(findings),'findings':findings,'tool_status':state}
+    (out/'vibesec-dast-report.json').write_text(json.dumps(report,indent=2))
+    (out/'vibesec-dast-summary.md').write_text(md(report))
+    (out/'vibesec-dast-report.html').write_text(html_report(report))
+
+
+def main():
+    p=argparse.ArgumentParser(); p.add_argument('--target',required=True); p.add_argument('--output',default='dast-results'); p.add_argument('--time-budget',type=int,default=240); p.add_argument('--report-only',action='store_true'); a=p.parse_args()
+    target=validate_target(a.target.strip()); out=Path(a.output); out.mkdir(parents=True,exist_ok=True)
+    if not a.report_only:
+        hrc=run(['httpx','-u',target,'-json','-silent','-status-code','-title','-tech-detect','-server','-follow-redirects','-timeout','10'],out/'httpx.jsonl',60)
+        nrc=run(['nuclei','-u',target,'-jsonl','-silent','-severity','low,medium,high,critical','-exclude-tags','dos,bruteforce','-rate-limit','15','-bulk-size','8','-timeout','8','-retries','0'],out/'nuclei.jsonl',a.time_budget)
+        (out/'scan-state.json').write_text(json.dumps({'httpx_exit_code':hrc,'nuclei_exit_code':nrc,'nuclei_timed_out':nrc==124},indent=2))
+    build_report(target,out)
+
+if __name__=='__main__': main()
