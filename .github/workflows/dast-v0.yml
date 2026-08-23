@@ -1,0 +1,67 @@
+name: VibeSec Optional DAST
+
+on:
+  workflow_dispatch:
+    inputs:
+      target:
+        description: Authorised HTTP or HTTPS target
+        required: true
+        default: https://example.com
+      authorisation:
+        description: Type I AM AUTHORIZED
+        required: true
+        default: I AM AUTHORIZED
+
+permissions:
+  contents: read
+
+jobs:
+  dast:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+
+    steps:
+      - name: Verify authorisation confirmation
+        shell: bash
+        run: |
+          if [ "${{ github.event.inputs.authorisation }}" != "I AM AUTHORIZED" ]; then
+            echo "Authorisation confirmation did not match required value."
+            exit 2
+          fi
+
+      - name: Check out VibeSec
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: stable
+
+      - name: Install httpx and Nuclei
+        shell: bash
+        run: |
+          go install github.com/projectdiscovery/httpx/cmd/httpx@latest
+          go install github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+
+      - name: Update Nuclei templates
+        shell: bash
+        run: |
+          "$(go env GOPATH)/bin/nuclei" -update-templates
+
+      - name: Run optional VibeSec DAST
+        shell: bash
+        run: |
+          python3 scripts/dast/vibesec_dast.py \
+            --target "${{ github.event.inputs.target }}" \
+            --output dast-results \
+            --time-budget 420
+
+      - name: Upload DAST results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: vibesec-dast-${{ github.run_id }}
+          path: dast-results/
+          if-no-files-found: warn
+          retention-days: 7
