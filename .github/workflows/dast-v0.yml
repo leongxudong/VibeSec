@@ -57,6 +57,17 @@ jobs:
             --output dast-results \
             --time-budget 420
 
+      - name: Publish mobile-friendly summary
+        if: always()
+        shell: bash
+        run: |
+          if [ -f dast-results/vibesec-dast-summary.md ]; then
+            cat dast-results/vibesec-dast-summary.md >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "# VibeSec DAST" >> "$GITHUB_STEP_SUMMARY"
+            echo "No readable summary was produced. Check the workflow logs/artifact." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
       - name: Upload DAST results
         if: always()
         uses: actions/upload-artifact@v4
