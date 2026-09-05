@@ -40,7 +40,7 @@ def main() -> int:
             print(f"Markdown report: {md}")
             print(f"JSON report:     {js}")
             return 0
-        except (ValueError, json.JSONDecodeError, OSError) as exc:  # type: ignore[name-defined]
+        except (ValueError, OSError) as exc:
             print(f"VibeSec error: {exc}")
             return 1
 
